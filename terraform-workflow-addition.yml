@@ -1,0 +1,136 @@
+# ADD THIS TO YOUR EXISTING TERRAFORM WORKFLOW
+# This automatically finds the latest Docker image for the current branch
+
+# Add this step early in your terraform job, before creating tfvars:
+
+      - name: Get latest Docker image for current branch
+        id: docker
+        run: |
+          # Get current branch name
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          echo "Current branch: $BRANCH_NAME"
+          
+          # Clean branch name (same as API workflow)
+          CLEAN_BRANCH=$(echo $BRANCH_NAME | sed 's/[^a-zA-Z0-9]/-/g')
+          echo "Clean branch: $CLEAN_BRANCH"
+          
+          # Docker Hub settings
+          DOCKER_USER="giligalili"
+          IMAGE_NAME="guestlistapi"
+          
+          # Query DockerHub API for tags
+          echo "Fetching tags from DockerHub..."
+          RESPONSE=$(curl -s "https://hub.docker.com/v2/repositories/${DOCKER_USER}/${IMAGE_NAME}/tags?page_size=100")
+          
+          # Get all tags and find the latest one for this branch
+          LATEST_TAG=$(echo $RESPONSE | jq -r '.results[].name' | grep "^${CLEAN_BRANCH}-" | sort -r | head -1)
+          
+          # If no tag found for branch, check if it's main branch
+          if [ -z "$LATEST_TAG" ]; then
+            if [ "$BRANCH_NAME" == "main" ]; then
+              echo "Using 'latest' tag for main branch"
+              LATEST_TAG="latest"
+            else
+              echo "ERROR: No Docker image found for branch ${BRANCH_NAME}"
+              echo "Looking for tags starting with: ${CLEAN_BRANCH}-"
+              echo ""
+              echo "Available tags:"
+              echo $RESPONSE | jq -r '.results[].name' | head -10
+              exit 1
+            fi
+          fi
+          
+          # Build full image path
+          FULL_IMAGE="${DOCKER_USER}/${IMAGE_NAME}:${LATEST_TAG}"
+          
+          echo "================================================"
+          echo "DOCKER IMAGE CONFIGURATION"
+          echo "================================================"
+          echo "Branch: $BRANCH_NAME"
+          echo "Clean Branch: $CLEAN_BRANCH"
+          echo "Latest Tag: $LATEST_TAG"
+          echo "Full Image: $FULL_IMAGE"
+          echo "================================================"
+          
+          # Save outputs for next steps
+          echo "branch=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+          echo "clean_branch=${CLEAN_BRANCH}" >> $GITHUB_OUTPUT
+          echo "tag=${LATEST_TAG}" >> $GITHUB_OUTPUT
+          echo "image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+          
+          # Also determine student/environment from branch
+          case "$BRANCH_NAME" in
+            *gili*)
+              STUDENT="gili"
+              ENV="dev"
+              ;;
+            *dvir*)
+              STUDENT="dvir"
+              ENV="dev"
+              ;;
+            *sivan*)
+              STUDENT="sivan"
+              ENV="dev"
+              ;;
+            *sahar*)
+              STUDENT="sahar"
+              ENV="dev"
+              ;;
+            staging)
+              STUDENT="staging"
+              ENV="staging"
+              ;;
+            dev)
+              STUDENT="dev"
+              ENV="dev"
+              ;;
+            main)
+              STUDENT="main"
+              ENV="prod"
+              ;;
+            *)
+              STUDENT="${CLEAN_BRANCH}"
+              ENV="dev"
+              ;;
+          esac
+          
+          echo "student=${STUDENT}" >> $GITHUB_OUTPUT
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+
+      # Then use these outputs in your terraform variables:
+      - name: Create Terraform variables
+        run: |
+          cat > terraform.tfvars <<EOF
+          # Cluster configuration
+          cluster_name = "guestlist-${{ steps.docker.outputs.student }}"
+          environment = "${{ steps.docker.outputs.environment }}"
+          student_name = "${{ steps.docker.outputs.student }}"
+          
+          # Docker image from API workflow
+          docker_image = "${{ steps.docker.outputs.image }}"
+          docker_image_tag = "${{ steps.docker.outputs.tag }}"
+          
+          # Your other variables...
+          aws_region = "${{ env.AWS_REGION }}"
+          node_instance_type = "${{ steps.docker.outputs.environment == 'prod' && 't3.small' || 't3.micro' }}"
+          node_desired_capacity = ${{ steps.docker.outputs.environment == 'prod' && '2' || '1' }}
+          EOF
+          
+          echo "Created terraform.tfvars with image: ${{ steps.docker.outputs.image }}"
+
+      # If you're updating an existing K8s deployment:
+      - name: Update Kubernetes deployment
+        run: |
+          # Configure kubectl (use your existing method)
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name guestlist-${{ steps.docker.outputs.student }}
+          
+          # Update the deployment with new image
+          kubectl set image deployment/guestlist-deployment \
+            guestlist=${{ steps.docker.outputs.image }} \
+            -n guestlist-dev
+          
+          # Force rollout to get latest
+          kubectl rollout restart deployment/guestlist-deployment -n guestlist-dev
+          kubectl rollout status deployment/guestlist-deployment -n guestlist-dev
+          
+          echo "Deployment updated with image: ${{ steps.docker.outputs.image }}"

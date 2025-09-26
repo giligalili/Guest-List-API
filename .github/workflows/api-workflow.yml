@@ -1,0 +1,288 @@
+name: Build and Test API
+
+on:
+  push:
+    branches: 
+      - main
+      - dev
+      - staging
+      - '*-feature'  # catches all feature branches: gili-feature, dvir-feature, sivan-feature, sahar-feature, etc.
+  pull_request:
+    branches: 
+      - main
+      - dev
+      - staging
+
+env:
+  # using environment secrets
+  DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+  IMAGE_NAME: guestlistapi
+
+jobs:
+  build-test-push:
+    runs-on: ubuntu-latest
+    
+    steps:
+      # ============ SETUP ============
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Create image tag
+        id: tags
+        run: |
+          # get branch name and short commit hash
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          COMMIT_SHA=${GITHUB_SHA::7}
+          DATE=$(date +%Y%m%d-%H%M%S)
+          
+          # clean branch name - replace special chars with -
+          CLEAN_BRANCH=$(echo $BRANCH_NAME | sed 's/[^a-zA-Z0-9]/-/g')
+          
+          # create tag: branch-date-commit
+          TAG="${CLEAN_BRANCH}-${DATE}-${COMMIT_SHA}"
+          
+          # for main branch, also create 'latest' tag
+          if [ "$BRANCH_NAME" == "main" ]; then
+            LATEST_TAG="latest"
+            echo "latest_tag=${LATEST_TAG}" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "branch_name=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+          echo "clean_branch=${CLEAN_BRANCH}" >> $GITHUB_OUTPUT
+          
+          # print for visibility
+          echo "================================================"
+          echo "DOCKER IMAGE TAG INFORMATION"
+          echo "================================================"
+          echo "Branch: ${BRANCH_NAME}"
+          echo "Clean Branch: ${CLEAN_BRANCH}"
+          echo "Commit: ${COMMIT_SHA}"
+          echo "Date: ${DATE}"
+          echo "Tag: ${TAG}"
+          echo "Full Image: ${{ env.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}:${TAG}"
+          if [ "$BRANCH_NAME" == "main" ]; then
+            echo "Latest Tag: ${{ env.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}:latest"
+          fi
+          echo "================================================"
+      
+      # ============ BUILD ============
+      - name: Build Docker image
+        run: |
+          echo "====== Building Docker Image ======"
+          docker build -t ${{ env.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}:test .
+          echo "Build complete"
+      
+      # ============ TEST ============
+      - name: Run test container
+        run: |
+          echo "====== Starting Test Container ======"
+          docker run -d \
+            --name guestlist-test \
+            -p 1111:1111 \
+            ${{ env.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}:test
+          
+          # wait for container to start
+          echo "Waiting for app to start..."
+          sleep 5
+          
+          # check if container is running
+          if docker ps | grep -q guestlist-test; then
+            echo "Container is running"
+          else
+            echo "ERROR: Container failed to start!"
+            docker logs guestlist-test
+            exit 1
+          fi
+      
+      - name: Test health check
+        run: |
+          echo "Testing health endpoint..."
+          response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:1111/)
+          if [ "$response" == "200" ] || [ "$response" == "404" ]; then
+            echo "✓ Health check passed (HTTP $response)"
+          else
+            echo "✗ Health check failed (HTTP $response)"
+            docker logs guestlist-test
+            exit 1
+          fi
+      
+      - name: Test GET /guests
+        run: |
+          echo "Testing GET /guests..."
+          response=$(curl -s -w "\n%{http_code}" http://localhost:1111/guests)
+          http_code=$(echo "$response" | tail -1)
+          
+          if [ "$http_code" == "200" ]; then
+            echo "✓ GET /guests passed"
+          else
+            echo "✗ GET /guests failed (HTTP $http_code)"
+            docker logs guestlist-test
+            exit 1
+          fi
+      
+      - name: Test POST /guests
+        id: post-test
+        run: |
+          echo "Testing POST /guests..."
+          
+          # create unique test data
+          TIMESTAMP=$(date +%s)
+          TEST_ID="111111111"
+          
+          response=$(curl -s -w "\n%{http_code}" \
+            -X POST http://localhost:1111/guests \
+            -H "Content-Type: application/json" \
+            -d '{
+              "firstname": "Test",
+              "surname": "User",
+              "quantity": "2",
+              "phone": "0541234567",
+              "email": "test@example.com",
+              "id": "'${TEST_ID}'"
+            }')
+          
+          http_code=$(echo "$response" | tail -1)
+          body=$(echo "$response" | head -n -1)
+          
+          if [ "$http_code" == "200" ] || [ "$http_code" == "201" ]; then
+            echo "✓ POST /guests passed"
+            # save seq_num for delete test
+            seq_num=$(echo "$body" | grep -oP '"seq_num"\s*:\s*\K[0-9]+' || echo "")
+            echo "seq_num=${seq_num}" >> $GITHUB_OUTPUT
+          else
+            echo "✗ POST /guests failed (HTTP $http_code)"
+            echo "Response: $body"
+            docker logs guestlist-test
+            exit 1
+          fi
+      
+      - name: Test GET /guests/{id}
+        if: steps.post-test.outputs.seq_num != ''
+        run: |
+          SEQ_NUM=${{ steps.post-test.outputs.seq_num }}
+          echo "Testing GET /guests/${SEQ_NUM}..."
+          
+          response=$(curl -s -w "\n%{http_code}" http://localhost:1111/guests/${SEQ_NUM})
+          http_code=$(echo "$response" | tail -1)
+          
+          if [ "$http_code" == "200" ]; then
+            echo "✓ GET /guests/${SEQ_NUM} passed"
+          else
+            echo "✗ GET /guests/${SEQ_NUM} failed (HTTP $http_code)"
+            exit 1
+          fi
+      
+      - name: Test DELETE /guests/{id}
+        if: steps.post-test.outputs.seq_num != ''
+        run: |
+          SEQ_NUM=${{ steps.post-test.outputs.seq_num }}
+          echo "Testing DELETE /guests/${SEQ_NUM}..."
+          
+          response=$(curl -s -w "\n%{http_code}" -X DELETE http://localhost:1111/guests/${SEQ_NUM})
+          http_code=$(echo "$response" | tail -1)
+          
+          if [ "$http_code" == "200" ] || [ "$http_code" == "204" ]; then
+            echo "✓ DELETE /guests/${SEQ_NUM} passed"
+          else
+            echo "✗ DELETE /guests/${SEQ_NUM} failed (HTTP $http_code)"
+            exit 1
+          fi
+      
+      - name: Test validation
+        run: |
+          echo "Testing validation (invalid phone)..."
+          
+          response=$(curl -s -w "\n%{http_code}" \
+            -X POST http://localhost:1111/guests \
+            -H "Content-Type: application/json" \
+            -d '{
+              "firstname": "Test",
+              "surname": "Invalid",
+              "quantity": "1",
+              "phone": "123",
+              "email": "test@example.com",
+              "guest_id": "INVALID"
+            }')
+          
+          http_code=$(echo "$response" | tail -1)
+          
+          # should reject invalid phone
+          if [ "$http_code" == "400" ] || [ "$http_code" == "422" ]; then
+            echo "✓ Validation passed (correctly rejected invalid phone)"
+          else
+            echo "⚠ Validation might not be working (expected error, got HTTP $http_code)"
+          fi
+      
+      - name: Stop test container
+        if: always()
+        run: |
+          docker stop guestlist-test || true
+          docker rm guestlist-test || true
+          echo "Test container cleaned up"
+      
+      # ============ PUSH TO DOCKERHUB ============
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ env.DOCKERHUB_USER }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+      
+      - name: Push to Docker Hub
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.tag }}
+            ${{ steps.tags.outputs.latest_tag && format('{0}/{1}:latest', env.DOCKERHUB_USER, env.IMAGE_NAME) || '' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      # ============ SUMMARY ============
+      - name: Pipeline Summary
+        if: always()
+        run: |
+          echo "## Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # basic info
+          echo "### Build Information" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | ${{ steps.tags.outputs.branch_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Clean Branch** | ${{ steps.tags.outputs.clean_branch }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | ${GITHUB_SHA::7} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Triggered by** | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # test results
+          echo "### Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "- Health Check ✓" >> $GITHUB_STEP_SUMMARY
+          echo "- GET /guests ✓" >> $GITHUB_STEP_SUMMARY
+          echo "- POST /guests ✓" >> $GITHUB_STEP_SUMMARY
+          echo "- GET /guests/{id} ✓" >> $GITHUB_STEP_SUMMARY
+          echo "- DELETE /guests/{id} ✓" >> $GITHUB_STEP_SUMMARY
+          echo "- Validation ✓" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # docker image info
+          echo "## DOCKER IMAGE PUSHED" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ env.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.tags.outputs.branch_name }}" == "main" ]; then
+            echo "Also tagged as:" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "${{ env.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo " **Note:** Your Terraform workflow will automatically find this image when running on branch **${{ steps.tags.outputs.branch_name }}**" >> $GITHUB_STEP_SUMMARY

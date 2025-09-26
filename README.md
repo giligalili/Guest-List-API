@@ -58,7 +58,7 @@ API is now running at: `http://localhost:1111`
   "quantity": "2",
   "phone": "0541234567",
   "email": "john@example.com",
-  "guest_id": "JD2025"
+  "id": "JD2025"
 }
 ```
 
@@ -68,7 +68,7 @@ API is now running at: `http://localhost:1111`
 
 - Quantity must be a positive number.
 - Israeli phone numbers: 10 digits, starts with `0`, numbers only.
-- `guest_id` must be unique.
+- `id` must be unique.
 - Guest data resets when server restarts (in-memory).
 
 ---
