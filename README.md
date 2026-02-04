@@ -83,5 +83,3 @@ docker push giligalili/guestlistapi:ver02
 ```
 
 ---
-
-Let me know if you’d like to extend this project—database integration, front-end dashboard, or even email invitations!
